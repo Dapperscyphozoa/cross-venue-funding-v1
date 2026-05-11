@@ -39,11 +39,15 @@ def init_db():
 
 
 def _migrate_schema(c: sqlite3.Connection):
-    """
-    Idempotent additive migrations. SQLite's CREATE TABLE IF NOT EXISTS does not
-    add columns to a pre-existing table, so we ALTER ADD COLUMN any new ones.
-    Each migration is wrapped in try/except so re-runs are safe.
-    """
+    """Migration shim: ensure cell_* columns exist on trades."""
+    def _try(sql):
+        try: c.execute(sql)
+        except Exception: pass
+    _try("ALTER TABLE trades ADD COLUMN cell_regime TEXT")
+    _try("ALTER TABLE trades ADD COLUMN cell_direction TEXT")
+    _try("ALTER TABLE trades ADD COLUMN cell_size_mult REAL")
+
+    # Legacy column migrations (each wrapped — re-runs safe)
     def _add_col(table: str, col_def: str):
         col_name = col_def.split()[0]
         existing = [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
@@ -182,18 +186,23 @@ def insert_trade(cloid: str, signal_id: int, coin: str, side: str, size: float,
                   entry_oid: Optional[int] = None,
                   live_filled: int = 0,
                   live_filled_px: Optional[float] = None,
-                  live_filled_sz: Optional[float] = None):
+                  live_filled_sz: Optional[float] = None,
+                  cell_regime: Optional[str] = None,
+                  cell_direction: Optional[str] = None,
+                  cell_size_mult: Optional[float] = None):
     with conn() as c:
         c.execute("""
             INSERT INTO trades (cloid, signal_id, ts_open, coin, side, size, entry_px,
                 sl_px, tp_px, notional, leverage, max_hold_bars, mode, status, pm_check_result,
-                exchange_cloid, entry_oid, live_filled, live_filled_px, live_filled_sz)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                exchange_cloid, entry_oid, live_filled, live_filled_px, live_filled_sz,
+                cell_regime, cell_direction, cell_size_mult)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             cloid, signal_id, int(time.time() * 1000), coin, side, size, entry_px,
             sl_px, tp_px, notional, leverage, max_hold_bars, mode, status,
             json.dumps(pm_check) if pm_check else None,
             exchange_cloid, entry_oid, live_filled, live_filled_px, live_filled_sz,
+            cell_regime, cell_direction, cell_size_mult,
         ))
 
 
@@ -299,7 +308,8 @@ def get_open_trades() -> list[dict]:
         rows = c.execute("""
             SELECT cloid, ts_open, coin, side, size, entry_px, sl_px, tp_px,
                    notional, leverage, max_hold_bars, mode, status,
-                   exchange_cloid, entry_oid, live_filled, live_filled_px, live_filled_sz
+                   exchange_cloid, entry_oid, live_filled, live_filled_px, live_filled_sz,
+                   cell_regime, cell_direction, cell_size_mult
             FROM trades WHERE status = 'open' ORDER BY ts_open ASC
         """).fetchall()
         return [{
@@ -308,6 +318,7 @@ def get_open_trades() -> list[dict]:
             "notional": r[8], "leverage": r[9], "max_hold_bars": r[10], "mode": r[11],
             "status": r[12], "exchange_cloid": r[13], "entry_oid": r[14],
             "live_filled": r[15], "live_filled_px": r[16], "live_filled_sz": r[17],
+            "cell_regime": r[18], "cell_direction": r[19], "cell_size_mult": r[20],
         } for r in rows]
 
 

@@ -305,6 +305,13 @@ class Handler(BaseHTTPRequestHandler):
                 qs = parse_qs(u.query)
                 limit = int(qs.get("limit", ["50"])[0])
                 _json(self, 200, {"closures": persistence.get_recent_closures(limit)})
+            elif u.path == "/cells":
+                from engine import cell_manager
+                qs = parse_qs(u.query)
+                only_active = qs.get("active", ["0"])[0] == "1"
+                cells = cell_manager.list_cells(persistence._db_path(),
+                                                  only_active=only_active)
+                _json(self, 200, {"cells": cells, "count": len(cells)})
             elif u.path == "/pnl":
                 _json(self, 200, persistence.get_pnl_summary())
             elif u.path == "/universe":

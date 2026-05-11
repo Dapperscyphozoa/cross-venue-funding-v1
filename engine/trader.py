@@ -18,6 +18,7 @@ from . import blacklist  # consecutive-loss tracker + dynamic blacklist
 
 from . import persistence
 from . import pm_client
+from . import cell_manager
 from .config import (
     PAPER_MODE, LIVE_TRADING, DRY_RUN, USE_TESTNET, CLOID_PREFIX,
     FIXED_NOTIONAL_USD,
@@ -136,6 +137,31 @@ def attempt_trade(coin: str, signal: dict) -> dict:
         except Exception as e:
             # Fail open — don't kill engine just because regime check failed
             print(f"[regime] classifier error for {coin}: {e}", flush=True)
+
+    # ---------- per-cell gate ----------
+    cell_regime_label = "unknown"
+    try:
+        from . import hl_data as _hd
+        from .config import STRATEGY_PARAMS as _sp
+        _tf = _sp.get("timeframe", "1h")
+        _rdf = _hd.fetch_candles(coin, _tf, n_bars=250)
+        if _rdf is not None and len(_rdf) >= 200:
+            cell_regime_label = regime_module.classify_latest_bar(_rdf) or "unknown"
+    except Exception:
+        pass
+    cell_direction = "long" if is_long else "short"
+    cell_size_mult = 1.0
+    try:
+        db_path = persistence._db_path()
+        cell_manager.init_schema(db_path)
+        cell_manager._load_seeds(db_path)
+        cell_allowed, cell_size_mult, cell_reason = cell_manager.gate_decision(
+            db_path, coin, cell_regime_label, cell_direction)
+        if not cell_allowed:
+            return {"status": "skipped",
+                     "reason": f"cell_gated[{coin}:{cell_regime_label}:{cell_direction}]:{cell_reason}"}
+    except Exception as e:
+        print(f"[cell] gate error: {e}", flush=True)
     # NB: ACTIVE_UNIVERSE check removed — scan loop already filters via
     # _get_active_universe() (dynamic full HL universe minus blacklist + BLOCKED).
     # The static config ACTIVE_UNIVERSE is now stale when USE_FULL_UNIVERSE=1.
@@ -176,6 +202,10 @@ def attempt_trade(coin: str, signal: dict) -> dict:
         size_scale = 1.0
 
     size, notional = position_size(equity, ref_px, sl_distance_pct, scale=size_scale)
+    try:
+        size *= cell_size_mult; notional *= cell_size_mult
+    except NameError:
+        pass
     if notional < 10:
         return {"status": "skipped",
                 "reason": f"notional_too_small: ${notional:.2f} (size_scale={size_scale:.3f})"}
@@ -194,6 +224,9 @@ def attempt_trade(coin: str, signal: dict) -> dict:
 
     # ===== Paper / dry-run path =====
     if mode in ("paper", "dry_run"):
+        signal["cell_regime"] = cell_regime_label
+        signal["cell_direction"] = cell_direction
+        signal["cell_size_mult"] = cell_size_mult
         signal_id = persistence.insert_signal(coin, signal, traded=True)
         if mode == "paper":
             persistence.insert_trade(
@@ -202,6 +235,9 @@ def attempt_trade(coin: str, signal: dict) -> dict:
                 sl_px=sl_px, tp_px=signal["tp_px"], notional=notional,
                 leverage=LEVERAGE, max_hold_bars=signal["max_hold_bars"],
                 mode=mode, pm_check=pm_check, status="open",
+                cell_regime=cell_regime_label,
+                cell_direction=cell_direction,
+                cell_size_mult=cell_size_mult,
             )
         return {
             "status": "opened" if mode == "paper" else "dry_run_logged",
@@ -307,6 +343,9 @@ def _live_open_trade(cloid, coin, signal, size, notional, sl_distance_pct,
             pm_check=pm_check, status="open",
             exchange_cloid=exchange_cloid, entry_oid=oid,
             live_filled=1, live_filled_px=actual_px, live_filled_sz=actual_sz,
+            cell_regime=signal.get("cell_regime"),
+            cell_direction=signal.get("cell_direction"),
+            cell_size_mult=signal.get("cell_size_mult"),
         )
         persistence.log_live_event("order_placed_and_filled", coin=coin, cloid=cloid,
                                     details={"oid": oid, "fill_px": actual_px, "fill_sz": actual_sz})
@@ -322,6 +361,9 @@ def _live_open_trade(cloid, coin, signal, size, notional, sl_distance_pct,
             sl_px=signal["sl_px"], tp_px=signal["tp_px"], notional=notional_actual,
             leverage=LEVERAGE, max_hold_bars=signal["max_hold_bars"],
             mode="live", pm_check=pm_check, status="pending",
+            cell_regime=signal.get("cell_regime"),
+            cell_direction=signal.get("cell_direction"),
+            cell_size_mult=signal.get("cell_size_mult"),
             exchange_cloid=exchange_cloid, entry_oid=oid, live_filled=0,
         )
         persistence.log_live_event("order_placed_resting", coin=coin, cloid=cloid,
@@ -479,11 +521,20 @@ def manage_open_trades(get_current_price_fn, get_current_atr_fn=None):
                 live_exit_oid=result.get("oid"),
                 live_exit_cloid=result.get("exchange_cloid"),
             )
-            # Update consecutive-loss tracker for this coin
             try:
                 blacklist.record_outcome(coin, gross_pnl - fees, outcome=outcome)
             except Exception as _e:
                 print(f"[trader] blacklist hook failed (live): {_e}", flush=True)
+            try:
+                sl_dist_pct = abs(entry_px - sl_px) / entry_px if entry_px > 0 else 0
+                pnl_pct = (actual_exit_px - entry_px) / entry_px if is_long else (entry_px - actual_exit_px) / entry_px
+                pnl_r_calc = pnl_pct / sl_dist_pct if sl_dist_pct > 0 else 0.0
+                _cell_reg = t.get("cell_regime") or t.get("regime_label") or "unknown"
+                _cell_dir = "long" if is_long else "short"
+                cell_manager.update_cell_on_close(persistence._db_path(),
+                    coin, _cell_reg, _cell_dir, pnl_r_calc)
+            except Exception as _e:
+                print(f"[cell] update failed (live): {_e}", flush=True)
             closed.append({"cloid": cloid, "coin": coin, "outcome": outcome,
                            "entry_px": entry_px, "exit_px": actual_exit_px,
                            "gross_pnl": gross_pnl, "net_pnl": gross_pnl - fees,
@@ -500,11 +551,20 @@ def manage_open_trades(get_current_price_fn, get_current_atr_fn=None):
                 gross_pnl=gross_pnl, fees=fees, bars_held=bars_held,
                 ref_notional=notional,
             )
-            # Update consecutive-loss tracker for this coin
             try:
                 blacklist.record_outcome(coin, gross_pnl - fees, outcome=outcome)
             except Exception as _e:
                 print(f"[trader] blacklist hook failed (paper): {_e}", flush=True)
+            try:
+                sl_dist_pct = abs(entry_px - sl_px) / entry_px if entry_px > 0 else 0
+                pnl_pct = (exit_px - entry_px) / entry_px if is_long else (entry_px - exit_px) / entry_px
+                pnl_r_calc = pnl_pct / sl_dist_pct if sl_dist_pct > 0 else 0.0
+                _cell_reg = t.get("cell_regime") or t.get("regime_label") or "unknown"
+                _cell_dir = "long" if is_long else "short"
+                cell_manager.update_cell_on_close(persistence._db_path(),
+                    coin, _cell_reg, _cell_dir, pnl_r_calc)
+            except Exception as _e:
+                print(f"[cell] update failed: {_e}", flush=True)
             closed.append({"cloid": cloid, "coin": coin, "outcome": outcome,
                            "entry_px": entry_px, "exit_px": exit_px,
                            "gross_pnl": gross_pnl, "net_pnl": gross_pnl - fees,
