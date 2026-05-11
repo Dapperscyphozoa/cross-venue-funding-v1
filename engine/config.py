@@ -60,6 +60,9 @@ BLOCKED_UNIVERSE   = [c for c in os.environ.get("BLOCKED_UNIVERSE", "").split(",
 # Lets us filter by historical per-coin / per-direction edge data.
 BLOCKED_LONGS      = [c for c in os.environ.get("BLOCKED_LONGS", "").split(",") if c]
 BLOCKED_SHORTS     = [c for c in os.environ.get("BLOCKED_SHORTS", "").split(",") if c]
+# Regimes this engine refuses to trade in. Local classifier in engine/regime.py.
+# Labels: trend_up, trend_down, range, chop
+BLOCKED_REGIMES    = [r for r in os.environ.get("BLOCKED_REGIMES", "").split(",") if r]
 ACTIVE_UNIVERSE    = [c for c in (PRIMARY_UNIVERSE + SECONDARY_UNIVERSE)
                       if c and c not in BLOCKED_UNIVERSE]
 

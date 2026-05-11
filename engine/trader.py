@@ -116,6 +116,26 @@ def attempt_trade(coin: str, signal: dict) -> dict:
         return {"status": "skipped", "reason": f"blocked_longs[{coin}]"}
     if (not is_long) and coin in BLOCKED_SHORTS:
         return {"status": "skipped", "reason": f"blocked_shorts[{coin}]"}
+
+    # Regime gate — skip if current regime label is in BLOCKED_REGIMES env list
+    from . import regime as regime_module
+    if regime_module.BLOCKED_REGIMES:
+        try:
+            # Use the candles available to the engine. The signal_detector was
+            # called with a df slice — but here in trader we don't have it.
+            # So we re-derive: fetch latest candles via hl_data and classify.
+            from . import hl_data
+            from .config import STRATEGY_PARAMS
+            tf = STRATEGY_PARAMS.get("timeframe", "1h")
+            regime_df = hl_data.fetch_candles(coin, tf, n_bars=250)
+            if regime_df is not None and len(regime_df) >= 200:
+                label = regime_module.classify_latest_bar(regime_df)
+                if regime_module.is_blocked(label):
+                    return {"status": "skipped",
+                             "reason": f"blocked_regime[{label}]"}
+        except Exception as e:
+            # Fail open — don't kill engine just because regime check failed
+            print(f"[regime] classifier error for {coin}: {e}", flush=True)
     # NB: ACTIVE_UNIVERSE check removed — scan loop already filters via
     # _get_active_universe() (dynamic full HL universe minus blacklist + BLOCKED).
     # The static config ACTIVE_UNIVERSE is now stale when USE_FULL_UNIVERSE=1.
