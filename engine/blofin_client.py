@@ -134,7 +134,7 @@ def get_mark_price(inst_id: str) -> Optional[float]:
     data = r.get("data") or []
     if not data: return None
     try:
-        return float(data[0].get("markPx", 0))
+        return float(data[0].get("markPrice", 0))
     except Exception:
         return None
 
