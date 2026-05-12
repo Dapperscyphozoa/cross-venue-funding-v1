@@ -31,6 +31,7 @@ from .config import (
     MACRO_CONFLUENCE_ENABLED, MACRO_BTC_COINS, MACRO_MIN_CONFLUENCE,
     ENSEMBLE_CONFLUENCE_ENABLED, ENSEMBLE_WINDOW_MIN,
     L2_IMBALANCE_ENABLED, L2_IMBALANCE_RANGE_PCT, L2_IMBALANCE_BLOCK_THRESHOLD,
+    SESSION_HOURS,
     HL_WALLET, HL_PRIVATE_KEY,
     LIVE_MIN_ACCOUNT_VALUE, LIVE_SIZE_SCALE, LIVE_EXIT_SLIPPAGE, LIVE_MAKER_ONLY_ENTRIES,
 )
@@ -112,6 +113,14 @@ def position_size(equity: float, ref_price: float, sl_distance_pct: float,
 
 def attempt_trade(coin: str, signal: dict) -> dict:
     """Try to open a trade based on a squeeze fade signal."""
+    # Session-of-day gate (UTC hour). Empty SESSION_HOURS = always allowed.
+    if SESSION_HOURS:
+        import datetime as _dt
+        hr = _dt.datetime.now(_dt.timezone.utc).hour
+        if hr not in SESSION_HOURS:
+            return {"status": "skipped",
+                     "reason": f"outside_session_hours[utc_hr={hr}]"}
+
     if HALT_STATE.get("active"):
         return {"status": "skipped", "reason": f"engine_halted: {HALT_STATE.get('reason')}"}
 

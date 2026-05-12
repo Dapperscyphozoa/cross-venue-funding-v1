@@ -152,6 +152,13 @@ ENSEMBLE_WINDOW_MIN = int(os.environ.get("ENSEMBLE_WINDOW_MIN", "60"))
 L2_IMBALANCE_ENABLED = os.environ.get("L2_IMBALANCE_ENABLED", "0") == "1"
 L2_IMBALANCE_RANGE_PCT = float(os.environ.get("L2_IMBALANCE_RANGE_PCT", "0.005"))
 L2_IMBALANCE_BLOCK_THRESHOLD = float(os.environ.get("L2_IMBALANCE_BLOCK_THRESHOLD", "-0.5"))
+
+# Session-of-day gate. UTC hours comma-separated. Empty = all hours allowed.
+# Example: "7,8,9,10,11,12,13,14,15" = London session only.
+SESSION_HOURS = set()
+_sh_env = os.environ.get("SESSION_HOURS", "").strip()
+if _sh_env:
+    SESSION_HOURS = {int(h.strip()) for h in _sh_env.split(",") if h.strip().isdigit()}
 MAKER_TP_ENABLED      = os.environ.get("MAKER_TP_ENABLED", "0") == "1"
 # HL builder code — if set, all orders route through this builder and we
 # collect 25-30% of taker fees as kickback (separate from maker rebate).
