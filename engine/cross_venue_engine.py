@@ -558,3 +558,76 @@ def scan_hl_premium() -> list:
 
     opportunities.sort(key=lambda x: -x["abs_premium_bp"])
     return opportunities
+
+
+
+def recover_positions_from_exchanges() -> int:
+    """On boot (live mode only), query HL + Blofin for existing positions
+    and rebuild the _positions dict so the engine survives Render restarts.
+
+    Returns count of recovered positions."""
+    if DRY_RUN:
+        return 0
+    bf_health = bf.health_check()
+    if not bf_health.get("auth_ok"):
+        print("[cvf:recover] Blofin auth not ready — skipping recovery", flush=True)
+        return 0
+
+    try:
+        from . import hl_exchange
+        hl = hl_exchange.HLExchange()
+    except Exception as e:
+        print(f"[cvf:recover] HL init failed: {e}", flush=True)
+        return 0
+
+    # Get HL positions
+    try:
+        hl_state = hl.get_account_state()
+        hl_positions = {p["coin"]: p for p in hl_state.get("assetPositions", [])
+                        if abs(float(p.get("szi", 0))) > 0}
+    except Exception as e:
+        print(f"[cvf:recover] HL fetch failed: {e}", flush=True)
+        hl_positions = {}
+
+    # Get Blofin positions
+    try:
+        bf_positions_raw = bf.get_positions("SWAP") or []
+        bf_positions = {p["instId"].replace("-USDT", ""): p
+                        for p in bf_positions_raw
+                        if abs(float(p.get("positions", 0))) > 0}
+    except Exception as e:
+        print(f"[cvf:recover] Blofin fetch failed: {e}", flush=True)
+        bf_positions = {}
+
+    # Cross-reference: any coin appearing in BOTH = a paired position we should track
+    recovered = 0
+    with _positions_lock:
+        for coin in set(hl_positions.keys()) & set(bf_positions.keys()):
+            hl_pos = hl_positions[coin]
+            bf_pos = bf_positions[coin]
+            hl_size = abs(float(hl_pos.get("szi", 0)))
+            hl_is_long = float(hl_pos.get("szi", 0)) > 0
+            bf_is_long = float(bf_pos.get("positions", 0)) > 0
+            # Check delta-neutral structure
+            if hl_is_long == bf_is_long:
+                print(f"[cvf:recover] {coin}: legs same direction (not cvf), skip", flush=True)
+                continue
+            direction = "long_hl_short_bf" if hl_is_long else "short_hl_long_bf"
+            entry_px = float(hl_pos.get("entryPx", 0)) or _fetch_hl_mark_price(coin) or 0
+            _positions[coin] = {
+                "coin": coin,
+                "direction": direction,
+                "opened_ts": int(time.time() * 1000),   # approximate; can't recover exact
+                "entry_px": entry_px,
+                "size_coin": hl_size,
+                "entry_spread_bp_hr": 0,   # unknown; will be updated on close
+                "hl_filled": True,
+                "bf_filled": True,
+                "bf_inst_id": f"{coin}-USDT",
+                "live": True,
+                "recovered": True,
+            }
+            recovered += 1
+            print(f"[cvf:recover] recovered {direction} on {coin}: size={hl_size}", flush=True)
+
+    return recovered

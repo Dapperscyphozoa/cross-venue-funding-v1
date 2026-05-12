@@ -48,6 +48,13 @@ def scan_loop():
     from engine import cross_venue_engine as cvf
     print(f"[cvf] cross-venue scan loop starting", flush=True)
     time.sleep(15)
+    # Recover any open paired positions from exchange state (survives Render restarts in LIVE mode)
+    try:
+        n = cvf.recover_positions_from_exchanges()
+        if n > 0:
+            print(f"[cvf] recovered {n} paired positions from exchange state", flush=True)
+    except Exception as e:
+        print(f"[cvf] recovery error: {e}", flush=True)
     cvf_interval = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
     while True:
         try:
