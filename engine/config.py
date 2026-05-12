@@ -117,6 +117,15 @@ MAKER_ONLY_MODE       = os.environ.get("MAKER_ONLY_MODE", "0") == "1"
 #   "skip"    — skip the trade if net exposure already same direction
 NET_DEDUP_MODE        = os.environ.get("NET_DEDUP_MODE", "off")
 NET_DEDUP_THRESHOLD_USD = float(os.environ.get("NET_DEDUP_THRESHOLD_USD", "100"))
+# Macro confluence — multiply cell_size_mult by /macro_state confluence factor
+# for the (coin_class, direction) of this trade. BTC vs alt classification
+# uses ALT_COINS env list (default: all known alts).
+MACRO_CONFLUENCE_MODE  = os.environ.get("MACRO_CONFLUENCE_MODE", "off")   # off | apply | skip_disagree
+MACRO_DISAGREE_THRESHOLD = float(os.environ.get("MACRO_DISAGREE_THRESHOLD", "0.7"))
+# Ensemble voting — query /confluence/{coin}/{direction} before firing.
+# When N engines agree on same coin/direction in last window, boost size.
+ENSEMBLE_VOTING_MODE   = os.environ.get("ENSEMBLE_VOTING_MODE", "off")  # off | apply
+ENSEMBLE_WINDOW_MIN    = int(os.environ.get("ENSEMBLE_WINDOW_MIN", "60"))
 
 # Macro confluence (walk-forward exposed missing macro context)
 # When enabled, trader queries PM /macro_state and scales cell_size_mult by

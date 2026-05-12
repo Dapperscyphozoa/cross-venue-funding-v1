@@ -114,6 +114,30 @@ def fetch_confluence(coin: str, direction: str, window_min: int = 60) -> Optiona
     return r
 
 
+def fetch_macro_state() -> Optional[dict]:
+    """Cross-asset macro regime + per-direction confluence multipliers.
+
+    Returns {regime_summary, confluence: {long_alt, short_alt, long_btc, short_btc}, ...}
+    None on PM unreachable — caller fails open (proceeds with multiplier 1.0).
+    """
+    r = _request("GET", "/macro_state")
+    if not r or r.get("_unreachable") or r.get("_http_error"):
+        return None
+    return r
+
+
+def fetch_confluence(coin: str, direction: str, window_min: int = 60) -> Optional[dict]:
+    """Cross-engine ensemble: how many other engines fired (coin, direction)
+    in the last window_min minutes?
+
+    Returns {n_engines_fired, engines: [...], confluence_mult: 1.0|1.3|1.6|2.0}
+    """
+    r = _request("GET", f"/confluence/{coin}/{direction}?window_min={window_min}")
+    if not r or r.get("_unreachable") or r.get("_http_error"):
+        return None
+    return r
+
+
 def fetch_net_position(coin: str) -> Optional[dict]:
     """Cross-engine portfolio netting helper.
 
