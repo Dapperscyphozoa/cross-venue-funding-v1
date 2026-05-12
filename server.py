@@ -44,21 +44,20 @@ def _origin_for_request(handler) -> str:
 
 # ===== Background workers =====
 def scan_loop():
-    """Every SCAN_INTERVAL_SEC: pull candles for each coin, detect signals, attempt trades."""
-    print(f"[scan] loop starting (interval={SCAN_INTERVAL_SEC}s, universe={ACTIVE_UNIVERSE})", flush=True)
-
-    # Initial cold sleep — let HL be ready, PM be ready
+    """Cross-venue funding arb loop. Replaces standard signal_detector scan."""
+    from engine import cross_venue_engine as cvf
+    print(f"[cvf] cross-venue scan loop starting", flush=True)
     time.sleep(15)
-
+    cvf_interval = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
     while True:
         try:
             if HALT_STATE.get("active"):
-                print(f"[scan] HALT active ({HALT_STATE.get('reason')}) — skipping scan", flush=True)
+                print(f"[cvf] HALT active ({HALT_STATE.get('reason')}) — skipping", flush=True)
             else:
-                _scan_once()
+                cvf.tick()
         except Exception as e:
-            print(f"[scan] loop error: {e}\n{traceback.format_exc()}", flush=True)
-        time.sleep(SCAN_INTERVAL_SEC)
+            print(f"[cvf] tick error: {e}\n{traceback.format_exc()}", flush=True)
+        time.sleep(cvf_interval)
 
 
 def _scan_once():
