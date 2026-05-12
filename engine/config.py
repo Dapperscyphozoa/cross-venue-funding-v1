@@ -110,6 +110,13 @@ MAX_OPEN_POSITIONS    = int(os.environ.get("MAX_OPEN_POSITIONS", "4"))
 # (taker fee), but TPs become resting maker limits when MAKER_TP_ENABLED=1.
 # Default paper fee model assumes taker entry + taker exit (worst case).
 MAKER_ONLY_MODE       = os.environ.get("MAKER_ONLY_MODE", "0") == "1"
+# Cross-engine portfolio netting (prevent duplicate-direction trades from
+# stacking fees). Modes:
+#   "off"     — no check (default for backwards compat)
+#   "size"    — proceed but reduce size proportionally if net exposure exists
+#   "skip"    — skip the trade if net exposure already same direction
+NET_DEDUP_MODE        = os.environ.get("NET_DEDUP_MODE", "off")
+NET_DEDUP_THRESHOLD_USD = float(os.environ.get("NET_DEDUP_THRESHOLD_USD", "100"))
 MAKER_TP_ENABLED      = os.environ.get("MAKER_TP_ENABLED", "0") == "1"
 # HL builder code — if set, all orders route through this builder and we
 # collect 25-30% of taker fees as kickback (separate from maker rebate).

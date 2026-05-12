@@ -85,6 +85,22 @@ def get_regime(coin: str) -> Optional[dict]:
     return r
 
 
+def fetch_net_position(coin: str) -> Optional[dict]:
+    """Cross-engine portfolio netting helper.
+
+    Returns the aggregate exposure to `coin` across all engines, e.g.:
+      {"coin": "BTC", "net_size": 0.05, "net_notional": 5000,
+       "net_direction": "long", "n_positions": 2,
+       "by_engine": {"wyckoff-v1": {...}, "funding-div-v1": {...}}}
+
+    Returns None on PM unreachable — caller should fail-open (proceed with trade).
+    """
+    r = _request("GET", f"/net_position/{coin}")
+    if not r or r.get("_unreachable") or r.get("_http_error"):
+        return None
+    return r
+
+
 def get_size_fraction(engine: str = ENGINE_NAME) -> float:
     """
     Returns the size_fraction this engine should apply to its default notional.

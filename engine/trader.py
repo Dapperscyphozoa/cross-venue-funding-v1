@@ -25,6 +25,7 @@ from .config import (
     LEVERAGE, MAX_NOTIONAL_PER_TRADE, MAX_OPEN_POSITIONS, RISK_PCT_PER_TRADE,
     HALT_STATE, ACTIVE_UNIVERSE, BLOCKED_UNIVERSE,
     TRADE_PARAMS, MAKER_ONLY_MODE, MAKER_TP_ENABLED, HL_BUILDER_CODE, BUILDER_KICKBACK_BPS,
+    NET_DEDUP_MODE, NET_DEDUP_THRESHOLD_USD,
     HL_WALLET, HL_PRIVATE_KEY,
     LIVE_MIN_ACCOUNT_VALUE, LIVE_SIZE_SCALE, LIVE_EXIT_SLIPPAGE, LIVE_MAKER_ONLY_ENTRIES,
 )
@@ -183,6 +184,27 @@ def attempt_trade(coin: str, signal: dict) -> dict:
                      "reason": f"cell_gated[{coin}:{cell_regime_label}:{cell_direction}]:{cell_reason}"}
     except Exception as e:
         print(f"[cell] gate error: {e}", flush=True)
+
+    # ---------- cross-engine portfolio netting ----------
+    if NET_DEDUP_MODE != "off":
+        try:
+            net = pm_client.fetch_net_position(coin)
+            if net and net.get("n_positions", 0) > 0:
+                net_dir = net.get("net_direction")
+                net_ntl = abs(net.get("net_notional") or 0)
+                my_dir = "long" if is_long else "short"
+                # Same direction with non-trivial exposure already on?
+                if net_dir == my_dir and net_ntl >= NET_DEDUP_THRESHOLD_USD:
+                    if NET_DEDUP_MODE == "skip":
+                        return {"status": "skipped",
+                                 "reason": f"net_dedup[{coin}:{my_dir}:${net_ntl:.0f}]"}
+                    elif NET_DEDUP_MODE == "size":
+                        # Halve size — already have exposure
+                        cell_size_mult = (cell_size_mult or 1.0) * 0.5
+                        print(f"[netdedup] {coin}:{my_dir} reducing size 50% "
+                              f"(net ${net_ntl:.0f} already on)", flush=True)
+        except Exception as e:
+            print(f"[netdedup] check failed: {e}", flush=True)
     # NB: ACTIVE_UNIVERSE check removed — scan loop already filters via
     # _get_active_universe() (dynamic full HL universe minus blacklist + BLOCKED).
     # The static config ACTIVE_UNIVERSE is now stale when USE_FULL_UNIVERSE=1.
