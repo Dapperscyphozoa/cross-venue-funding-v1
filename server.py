@@ -276,6 +276,9 @@ class Handler(BaseHTTPRequestHandler):
             elif u.path == "/cross_venue/scan":
                 from engine import cross_venue_engine as _cvf
                 _json(self, 200, {"opportunities": _cvf.scan_opportunities()})
+            elif u.path == "/cross_venue/divergence":
+                from engine import cross_venue_engine as _cvf
+                _json(self, 200, {"divergences": _cvf.scan_price_divergence()})
             elif u.path == "/live/status":
                 # Detailed live-mode introspection
                 client = trader._get_hl_client()

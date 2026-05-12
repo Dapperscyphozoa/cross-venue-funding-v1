@@ -406,3 +406,42 @@ def get_state() -> dict:
         "positions": pos_snapshot,
         "blofin_health": bf.health_check(),
     }
+
+
+
+# ─── Cross-venue price divergence detector ──────────────────────────────────
+
+def scan_price_divergence() -> list:
+    """Detect price divergence between HL and Blofin for arbitrage.
+
+    When HL_price and Blofin_price differ by > PRICE_DIVERGENCE_MIN_PCT,
+    there's a tradable arb (long the cheap venue, short the expensive one).
+
+    Convergence happens via funding + maker flow, usually within minutes.
+    """
+    MIN_PCT = float(os.environ.get("PRICE_DIVERGENCE_MIN_PCT", "0.002"))   # 0.2%
+    divergences = []
+    for coin in COINS:
+        coin = coin.strip().upper()
+        if not coin: continue
+        hl_px = _fetch_hl_mark_price(coin)
+        bf_px = bf.get_mark_price(f"{coin}-USDT")
+        if hl_px is None or bf_px is None: continue
+        if hl_px <= 0 or bf_px <= 0: continue
+        diff_pct = (hl_px - bf_px) / ((hl_px + bf_px) / 2)
+        if abs(diff_pct) < MIN_PCT: continue
+        if diff_pct > 0:
+            # HL is more expensive — short HL, long Blofin
+            action = "short_hl_long_bf"
+        else:
+            action = "long_hl_short_bf"
+        divergences.append({
+            "coin": coin,
+            "hl_price": hl_px,
+            "bf_price": bf_px,
+            "diff_pct": diff_pct * 100,
+            "diff_bp": diff_pct * 10000,
+            "action": action,
+        })
+    divergences.sort(key=lambda x: -abs(x["diff_pct"]))
+    return divergences
