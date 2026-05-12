@@ -140,6 +140,14 @@ def scan_opportunities() -> list:
 
 
 # ───── Position tracker ──────────────────────────────────────────────────────
+from .github_state import GithubState
+
+# GitHub-backed persistence for DRY_RUN paper positions (survives Render restarts)
+_GH_STATE = GithubState(
+    owner="Dapperscyphozoa", repo="multica",
+    path=f"engine_state/cross-venue-funding-v1/positions.json",
+)
+
 _positions: Dict[str, Dict[str, Any]] = {}   # coin -> {opened_ts, direction, hl_size, bf_size, ...}
 _positions_lock = threading.Lock()
 
@@ -162,18 +170,26 @@ def _persist_positions():
 
 
 def _load_positions():
+    """Load _positions from GitHub (or /tmp fallback) on boot."""
+    global _positions
     try:
-        with open(_state_file) as f:
-            data = json.load(f)
-        with _positions_lock:
-            _positions.update(data)
-        if data:
-            print(f"[cvf] restored {len(data)} positions from disk: "
-                   f"{list(data.keys())}", flush=True)
-    except FileNotFoundError:
-        pass
+        # Try GitHub first
+        snapshot = _GH_STATE.load(default=None)
+        if not snapshot:
+            # Fallback to /tmp file
+            local_path = os.path.join(STATE_DIR, "cvf_positions.json")
+            if os.path.exists(local_path):
+                with open(local_path) as f:
+                    snapshot = json.load(f)
+        if snapshot and isinstance(snapshot, dict):
+            saved_positions = snapshot.get("positions", {})
+            if isinstance(saved_positions, dict):
+                _positions.update(saved_positions)
+                print(f"[cvf] restored {len(saved_positions)} positions from GitHub state", flush=True)
     except Exception as e:
-        print(f"[cvf] load error: {e}", flush=True)
+        print(f"[cvf] load err: {e}", flush=True)
+
+
 
 
 _load_positions()
