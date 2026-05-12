@@ -172,19 +172,93 @@ def open_paired_position(opp: dict) -> Optional[dict]:
             _positions[coin] = pos
         return pos
 
-    # Real execution path (when DRY_RUN=0 and creds set)
-    # Determine sides
-    if direction == "long_hl_short_bf":
-        hl_side = "B"   # buy HL
-        bf_side = "sell"
-    else:
-        hl_side = "A"   # sell HL
-        bf_side = "buy"
+    # ── LIVE EXECUTION ──
+    # Direction:
+    #   long_hl_short_bf: BUY HL perp + SELL Blofin perp
+    #   short_hl_long_bf: SELL HL perp + BUY Blofin perp
+    bf_health = bf.health_check()
+    if not bf_health.get("auth_ok"):
+        print(f"[cvf] LIVE blocked — Blofin auth not ready: {bf_health.get('error')}", flush=True)
+        return None
 
-    # NOTE: this requires the engine's hl_exchange wrapper. Wire next iteration.
-    # For now, log + return for backtest-style simulation
-    print(f"[cvf] LIVE EXECUTION not yet wired - DRY_RUN forced", flush=True)
-    return None
+    from . import hl_exchange
+    try:
+        hl = hl_exchange.HLExchange()
+        if not getattr(hl, "armed", False):
+            print(f"[cvf] LIVE blocked — HL exchange not armed", flush=True)
+            return None
+    except Exception as e:
+        print(f"[cvf] LIVE blocked — HL init failed: {e}", flush=True)
+        return None
+
+    # Compute HL contract size (in coin units, rounded to sz_decimals)
+    hl_sz_decimals = hl.get_sz_decimals(coin)
+    hl_size = round(size_coin, hl_sz_decimals)
+    if hl_size <= 0:
+        print(f"[cvf] LIVE blocked — HL size rounded to 0", flush=True)
+        return None
+
+    # Blofin contract size: convert coin-units to contract count via instrument spec
+    bf_inst = f"{coin}-USDT"
+    bf_size_str = bf.coin_size_to_contracts(coin, hl_size)
+    if bf_size_str is None:
+        print(f"[cvf] Blofin size conversion failed for {coin} — instrument unsupported?", flush=True)
+        return None
+
+    hl_is_buy = direction == "long_hl_short_bf"
+    bf_side = "sell" if hl_is_buy else "buy"
+
+    internal_cloid = f"cvf_{coin}_{int(time.time())}"
+
+    # Step 1: Place HL market order
+    print(f"[cvf] LIVE opening {direction} on {coin}: HL {'BUY' if hl_is_buy else 'SELL'} {hl_size} @ market", flush=True)
+    hl_result = hl.place_market_order(coin, hl_is_buy, hl_size, internal_cloid)
+    if hl_result.get("status") != "ok":
+        print(f"[cvf] HL leg failed: {hl_result}", flush=True)
+        return None
+    hl_fill_px = hl_result.get("avg_px") or mark_px
+
+    # Step 2: Place Blofin market order
+    print(f"[cvf] LIVE opening Blofin {bf_side} {bf_size_str} on {bf_inst}", flush=True)
+    bf_result = bf.place_order(
+        inst_id=bf_inst,
+        side=bf_side,
+        size=bf_size_str,
+        order_type="market",
+        position_side="net",
+        client_order_id=internal_cloid,
+        leverage="1",
+    )
+
+    # Step 3: If Blofin failed, immediately close HL leg (delta-neutral broken)
+    if not bf_result or bf_result.get("code") not in ("0", 0):
+        print(f"[cvf] Blofin leg failed: {bf_result} — reversing HL leg", flush=True)
+        try:
+            hl.market_close_position(coin, internal_cloid)
+        except Exception as e:
+            print(f"[cvf] CRITICAL: HL reverse failed: {e} — manual intervention required", flush=True)
+        return None
+
+    bf_order_id = (bf_result.get("data") or [{}])[0].get("orderId")
+    print(f"[cvf] LIVE both legs filled: HL={internal_cloid} BF={bf_order_id}", flush=True)
+
+    pos = {
+        "coin": coin,
+        "direction": direction,
+        "opened_ts": int(time.time() * 1000),
+        "entry_px": hl_fill_px,
+        "size_coin": hl_size,
+        "entry_spread_bp_hr": opp["spread_bp_hr"],
+        "hl_internal_cloid": internal_cloid,
+        "hl_filled": True,
+        "bf_order_id": bf_order_id,
+        "bf_filled": True,
+        "bf_inst_id": bf_inst,
+        "live": True,
+    }
+    with _positions_lock:
+        _positions[coin] = pos
+    return pos
 
 
 def close_paired_position(coin: str) -> Optional[dict]:
@@ -192,19 +266,47 @@ def close_paired_position(coin: str) -> Optional[dict]:
         pos = _positions.pop(coin, None)
     if not pos:
         return None
+
+    held_hours = (int(time.time() * 1000) - pos["opened_ts"]) / 3600_000
+    accrued_bp = pos["entry_spread_bp_hr"] * held_hours
+    accrued_usd = (accrued_bp / 10000) * POSITION_NOTIONAL_USD
+    pos["closed_ts"] = int(time.time() * 1000)
+    pos["held_hours"] = held_hours
+    pos["accrued_bp"] = accrued_bp
+    pos["accrued_usd"] = accrued_usd
+
     if pos.get("dry_run"):
-        held_hours = (int(time.time() * 1000) - pos["opened_ts"]) / 3600_000
-        accrued_bp = pos["entry_spread_bp_hr"] * held_hours
-        accrued_usd = (accrued_bp / 10000) * POSITION_NOTIONAL_USD
         print(f"[cvf:DRY_RUN] closed {pos['direction']} on {coin} "
               f"after {held_hours:.1f}h, accrued ~{accrued_bp:.2f}bp "
               f"(~${accrued_usd:.2f})", flush=True)
-        pos["closed_ts"] = int(time.time() * 1000)
-        pos["held_hours"] = held_hours
-        pos["accrued_bp"] = accrued_bp
-        pos["accrued_usd"] = accrued_usd
         return pos
-    return None
+
+    if pos.get("live"):
+        # Close HL leg first
+        from . import hl_exchange
+        coin = pos["coin"]
+        hl_cloid = pos.get("hl_internal_cloid")
+        bf_inst = pos.get("bf_inst_id")
+        try:
+            hl = hl_exchange.HLExchange()
+            hl_close = hl.market_close_position(coin, hl_cloid)
+            print(f"[cvf:LIVE] HL close {coin}: {hl_close.get('status')}", flush=True)
+        except Exception as e:
+            print(f"[cvf:LIVE] HL close failed: {e}", flush=True)
+
+        # Close Blofin leg
+        try:
+            bf_close = bf.close_position(bf_inst, "net")
+            print(f"[cvf:LIVE] Blofin close {bf_inst}: {bf_close}", flush=True)
+        except Exception as e:
+            print(f"[cvf:LIVE] Blofin close failed: {e}", flush=True)
+
+        print(f"[cvf:LIVE] {pos['direction']} closed on {coin} "
+              f"after {held_hours:.1f}h, accrued ~{accrued_bp:.2f}bp "
+              f"(~${accrued_usd:.2f})", flush=True)
+        return pos
+
+    return pos
 
 
 def check_closing_conditions(coin: str, current_spread_bp_hr: float) -> Optional[str]:
