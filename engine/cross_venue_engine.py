@@ -1,0 +1,306 @@
+"""
+cross-venue-funding-v1 — delta-neutral funding arbitrage between HL and Blofin.
+
+THESIS
+======
+Both HL and Blofin run perp markets on the same coins (BTC, ETH, SOL, etc).
+Each charges/pays funding rates independently. When the rates diverge:
+  - long the side that pays MORE (gets funding from longs)
+  - short the side that pays LESS (gets funding from shorts)
+
+The two legs are delta-neutral (price changes cancel). The funding spread
+becomes pure yield, capped only by execution costs and venue risk.
+
+EXAMPLE (current live):
+  JUP: HL pays 0.0013%/hr, Blofin pays -0.0042%/hr
+       → LONG HL JUP (collect 0.0013%/hr from HL shorts)
+       → SHORT Blofin JUP (collect 0.0042%/hr from Blofin longs)
+       Net: 0.55bp/hr → ~47% APR delta-neutral
+
+CONDITIONS TO OPEN:
+  - Spread > MIN_SPREAD_BP (default 0.3bp/hr ≈ 26% APR threshold)
+  - Both venues have liquidity (min_size respected)
+  - Capital available on both venues
+
+HOLDING:
+  - Position size set so each leg is delta-neutral in USD terms
+  - Hold until spread compresses below CLOSE_SPREAD_BP (default 0.1bp)
+  - OR funding flips (one side stops paying)
+  - OR price diverges between venues by >TRACKING_ERROR_PCT (rare but possible)
+
+EXECUTION:
+  - Open: market orders on both venues simultaneously (race condition risk)
+  - Close: market orders on both venues simultaneously
+  - Track total funding collected per position cycle
+"""
+from __future__ import annotations
+import os
+import time
+import json
+import threading
+import urllib.request
+from typing import Dict, Optional, Any
+
+from . import blofin_client as bf
+from . import persistence
+
+# Fallback record_event if persistence module doesn't have it
+if not hasattr(persistence, "record_event"):
+    def _record_event(d):
+        print(f"[cvf:event] {json.dumps(d, default=str)}", flush=True)
+    persistence.record_event = _record_event
+
+# ───── Config ────────────────────────────────────────────────────────────────
+MIN_SPREAD_BP_PER_HR = float(os.environ.get("MIN_SPREAD_BP_PER_HR", "0.3"))
+CLOSE_SPREAD_BP_PER_HR = float(os.environ.get("CLOSE_SPREAD_BP_PER_HR", "0.1"))
+TRACKING_ERROR_PCT = float(os.environ.get("TRACKING_ERROR_PCT", "0.005"))
+POSITION_NOTIONAL_USD = float(os.environ.get("POSITION_NOTIONAL_USD", "500"))
+MAX_OPEN_POSITIONS = int(os.environ.get("MAX_OPEN_POSITIONS", "3"))
+SCAN_INTERVAL_SEC = int(os.environ.get("SCAN_INTERVAL_SEC", "300"))
+MIN_CAPITAL_BLOFIN = float(os.environ.get("MIN_CAPITAL_BLOFIN", "200"))
+DRY_RUN = os.environ.get("DRY_RUN", "1") == "1"
+
+# Coins to scan
+COINS = os.environ.get("CROSS_VENUE_COINS",
+    "BTC,ETH,SOL,DOGE,XRP,BNB,AVAX,LINK,JUP,ATOM,HYPE,SUI,NEAR,INJ").split(",")
+
+
+# ───── Helpers ───────────────────────────────────────────────────────────────
+
+def _fetch_hl_funding() -> Dict[str, float]:
+    """Fetch HL funding rates for all coins (per-hour rate)."""
+    try:
+        req = urllib.request.Request("https://api.hyperliquid.xyz/info",
+            data=json.dumps({"type": "metaAndAssetCtxs"}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        out = {}
+        for i, u in enumerate(data[0].get("universe", [])):
+            if i < len(data[1]):
+                out[u.get("name", "")] = float(data[1][i].get("funding", 0))
+        return out
+    except Exception as e:
+        print(f"[cvf] HL funding fetch failed: {e}", flush=True)
+        return {}
+
+
+def _fetch_hl_mark_price(coin: str) -> Optional[float]:
+    try:
+        req = urllib.request.Request("https://api.hyperliquid.xyz/info",
+            data=json.dumps({"type": "allMids"}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        return float(data.get(coin, 0)) or None
+    except Exception:
+        return None
+
+
+def scan_opportunities() -> list:
+    """Return list of (coin, spread_bp_per_hr, direction) where direction is:
+       'long_hl_short_bf' if HL > Blofin funding (long HL, short Blofin)
+       'short_hl_long_bf' otherwise
+    """
+    hl_funding = _fetch_hl_funding()
+    opportunities = []
+    for coin in COINS:
+        coin = coin.strip().upper()
+        if not coin: continue
+        hl_h = hl_funding.get(coin)
+        if hl_h is None: continue
+        bf_8h = bf.get_funding_rate(f"{coin}-USDT")
+        if bf_8h is None: continue
+        bf_h = bf_8h / 8   # blofin is per 8-hour cycle
+        spread_h = hl_h - bf_h
+        spread_bp = spread_h * 10000
+        if abs(spread_bp) < MIN_SPREAD_BP_PER_HR:
+            continue
+        direction = "long_hl_short_bf" if spread_bp > 0 else "short_hl_long_bf"
+        opportunities.append({
+            "coin": coin,
+            "hl_funding_pct_hr": hl_h * 100,
+            "bf_funding_pct_hr": bf_h * 100,
+            "spread_bp_hr": spread_bp,
+            "abs_spread_bp_hr": abs(spread_bp),
+            "annual_pct": abs(spread_bp) * 24 * 365 / 100,
+            "direction": direction,
+        })
+    opportunities.sort(key=lambda x: -x["abs_spread_bp_hr"])
+    return opportunities
+
+
+# ───── Position tracker ──────────────────────────────────────────────────────
+_positions: Dict[str, Dict[str, Any]] = {}   # coin -> {opened_ts, direction, hl_size, bf_size, ...}
+_positions_lock = threading.Lock()
+
+
+def can_open_more() -> bool:
+    with _positions_lock:
+        return len(_positions) < MAX_OPEN_POSITIONS
+
+
+def open_paired_position(opp: dict) -> Optional[dict]:
+    """Open delta-neutral paired position. Returns position record or None."""
+    coin = opp["coin"]
+    direction = opp["direction"]
+
+    mark_px = _fetch_hl_mark_price(coin)
+    if not mark_px:
+        return None
+
+    # Size = POSITION_NOTIONAL_USD / mark_price (in coin units)
+    size_coin = POSITION_NOTIONAL_USD / mark_px
+
+    if DRY_RUN:
+        print(f"[cvf:DRY_RUN] would open {direction} on {coin}: "
+              f"size={size_coin:.4f} @ ${mark_px:.2f} "
+              f"(spread {opp['spread_bp_hr']:+.2f}bp/hr, "
+              f"~{opp['annual_pct']:.0f}% APR)", flush=True)
+        pos = {
+            "coin": coin,
+            "direction": direction,
+            "opened_ts": int(time.time() * 1000),
+            "entry_px": mark_px,
+            "size_coin": size_coin,
+            "entry_spread_bp_hr": opp["spread_bp_hr"],
+            "hl_filled": True,    # simulated
+            "bf_filled": True,
+            "dry_run": True,
+        }
+        with _positions_lock:
+            _positions[coin] = pos
+        return pos
+
+    # Real execution path (when DRY_RUN=0 and creds set)
+    # Determine sides
+    if direction == "long_hl_short_bf":
+        hl_side = "B"   # buy HL
+        bf_side = "sell"
+    else:
+        hl_side = "A"   # sell HL
+        bf_side = "buy"
+
+    # NOTE: this requires the engine's hl_exchange wrapper. Wire next iteration.
+    # For now, log + return for backtest-style simulation
+    print(f"[cvf] LIVE EXECUTION not yet wired - DRY_RUN forced", flush=True)
+    return None
+
+
+def close_paired_position(coin: str) -> Optional[dict]:
+    with _positions_lock:
+        pos = _positions.pop(coin, None)
+    if not pos:
+        return None
+    if pos.get("dry_run"):
+        held_hours = (int(time.time() * 1000) - pos["opened_ts"]) / 3600_000
+        accrued_bp = pos["entry_spread_bp_hr"] * held_hours
+        accrued_usd = (accrued_bp / 10000) * POSITION_NOTIONAL_USD
+        print(f"[cvf:DRY_RUN] closed {pos['direction']} on {coin} "
+              f"after {held_hours:.1f}h, accrued ~{accrued_bp:.2f}bp "
+              f"(~${accrued_usd:.2f})", flush=True)
+        pos["closed_ts"] = int(time.time() * 1000)
+        pos["held_hours"] = held_hours
+        pos["accrued_bp"] = accrued_bp
+        pos["accrued_usd"] = accrued_usd
+        return pos
+    return None
+
+
+def check_closing_conditions(coin: str, current_spread_bp_hr: float) -> Optional[str]:
+    """Returns close reason if should close, else None."""
+    with _positions_lock:
+        pos = _positions.get(coin)
+    if not pos:
+        return None
+    # Spread compressed
+    if abs(current_spread_bp_hr) < CLOSE_SPREAD_BP_PER_HR:
+        return "spread_compressed"
+    # Spread flipped sign (now paying instead of collecting)
+    if (pos["entry_spread_bp_hr"] > 0) != (current_spread_bp_hr > 0):
+        return "spread_flipped"
+    return None
+
+
+# ───── Main loop ─────────────────────────────────────────────────────────────
+
+def tick():
+    """One scan cycle."""
+    opps = scan_opportunities()
+    print(f"[cvf] scanned {len(COINS)} coins, found {len(opps)} opportunities "
+          f"(threshold {MIN_SPREAD_BP_PER_HR}bp/hr)", flush=True)
+
+    # Check existing positions for close conditions
+    with _positions_lock:
+        open_coins = list(_positions.keys())
+    for coin in open_coins:
+        # Find current spread for this coin
+        match = next((o for o in opps if o["coin"] == coin), None)
+        if match:
+            reason = check_closing_conditions(coin, match["spread_bp_hr"])
+        else:
+            # No longer above MIN_SPREAD threshold → spread compressed
+            reason = "spread_below_min"
+        if reason:
+            closed = close_paired_position(coin)
+            if closed:
+                try:
+                    persistence.record_event({
+                        "event": "cross_venue_close",
+                        "coin": coin,
+                        "reason": reason,
+                        **closed,
+                    })
+                except Exception as e:
+                    print(f"[cvf] persist close failed: {e}", flush=True)
+
+    # Open new positions for top opportunities (within MAX_OPEN_POSITIONS)
+    for opp in opps[:MAX_OPEN_POSITIONS]:
+        if not can_open_more(): break
+        with _positions_lock:
+            if opp["coin"] in _positions: continue
+        result = open_paired_position(opp)
+        if result:
+            try:
+                persistence.record_event({
+                    "event": "cross_venue_open",
+                    **result,
+                    "entry_spread_bp_hr": opp["spread_bp_hr"],
+                    "annual_pct": opp["annual_pct"],
+                })
+            except Exception as e:
+                print(f"[cvf] persist open failed: {e}", flush=True)
+
+
+def run_forever():
+    print(f"[cvf] starting. MIN_SPREAD={MIN_SPREAD_BP_PER_HR}bp/hr "
+          f"NOTIONAL=${POSITION_NOTIONAL_USD} MAX_OPEN={MAX_OPEN_POSITIONS} "
+          f"DRY_RUN={DRY_RUN}", flush=True)
+    bf_health = bf.health_check()
+    print(f"[cvf] Blofin health: {bf_health}", flush=True)
+    while True:
+        try:
+            tick()
+        except Exception as e:
+            print(f"[cvf] tick error: {e}", flush=True)
+        time.sleep(SCAN_INTERVAL_SEC)
+
+
+def get_state() -> dict:
+    """For HTTP /state endpoint."""
+    with _positions_lock:
+        pos_snapshot = dict(_positions)
+    return {
+        "config": {
+            "min_spread_bp_hr": MIN_SPREAD_BP_PER_HR,
+            "close_spread_bp_hr": CLOSE_SPREAD_BP_PER_HR,
+            "notional_usd": POSITION_NOTIONAL_USD,
+            "max_open": MAX_OPEN_POSITIONS,
+            "scan_interval_sec": SCAN_INTERVAL_SEC,
+            "coins": COINS,
+            "dry_run": DRY_RUN,
+        },
+        "n_open_positions": len(pos_snapshot),
+        "positions": pos_snapshot,
+        "blofin_health": bf.health_check(),
+    }

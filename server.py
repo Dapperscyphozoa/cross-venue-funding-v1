@@ -261,13 +261,21 @@ class Handler(BaseHTTPRequestHandler):
                                    "halted": HALT_STATE.get("active", False),
                                    "mode_effective": trader._effective_mode()})
             elif u.path == "/state":
+                from engine import cross_venue_engine as _cvf
                 _json(self, 200, {
                     "halt": HALT_STATE,
                     "mode_effective": trader._effective_mode(),
                     "open_trades": persistence.get_open_trades(),
                     "pending_live": persistence.get_pending_live_trades(),
                     "pnl": persistence.get_pnl_summary(),
+                    "cross_venue": _cvf.get_state(),
                 })
+            elif u.path == "/cross_venue":
+                from engine import cross_venue_engine as _cvf
+                _json(self, 200, _cvf.get_state())
+            elif u.path == "/cross_venue/scan":
+                from engine import cross_venue_engine as _cvf
+                _json(self, 200, {"opportunities": _cvf.scan_opportunities()})
             elif u.path == "/live/status":
                 # Detailed live-mode introspection
                 client = trader._get_hl_client()
