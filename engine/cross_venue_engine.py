@@ -497,3 +497,64 @@ def scan_price_divergence() -> list:
 
     divergences.sort(key=lambda x: -abs(x["diff_pct"]))
     return divergences
+
+
+
+# ─── HL oracle/mark premium scanner ────────────────────────────────────────
+
+def scan_hl_premium() -> list:
+    """Detect significant premium between HL mark price and oracle.
+
+    HL exposes both:
+      - oraclePx: TWAP from external spot venues
+      - markPx: HL perp orderbook-derived
+      - premium: (mark - oracle) / oracle
+
+    When |premium| > threshold, mark typically converges to oracle quickly
+    (seconds to minutes). The arb is:
+      premium > 0 (mark > oracle): SHORT mark, wait for catch down
+      premium < 0 (mark < oracle): LONG mark, wait for catch up
+    """
+    MIN_PREMIUM_BP = float(os.environ.get("HL_PREMIUM_MIN_BP", "5"))   # 5bp
+
+    try:
+        req = urllib.request.Request("https://api.hyperliquid.xyz/info",
+            data=json.dumps({"type": "metaAndAssetCtxs"}).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            data = json.loads(r.read())
+    except Exception:
+        return []
+
+    universe = data[0].get("universe", [])
+    ctxs = data[1]
+    opportunities = []
+
+    for i, u in enumerate(universe):
+        if i >= len(ctxs): continue
+        coin = u.get("name", "")
+        ctx = ctxs[i]
+        try:
+            oracle = float(ctx.get("oraclePx", 0))
+            mark = float(ctx.get("markPx", 0))
+            premium = float(ctx.get("premium", 0))
+        except Exception:
+            continue
+
+        if oracle <= 0: continue
+        premium_bp = premium * 10000   # premium in bp
+        if abs(premium_bp) < MIN_PREMIUM_BP: continue
+
+        action = "short" if premium > 0 else "long"
+        opportunities.append({
+            "coin": coin,
+            "oracle_px": oracle,
+            "mark_px": mark,
+            "premium_bp": premium_bp,
+            "abs_premium_bp": abs(premium_bp),
+            "action": action,
+            "expected_target_px": oracle,
+        })
+
+    opportunities.sort(key=lambda x: -x["abs_premium_bp"])
+    return opportunities
