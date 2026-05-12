@@ -98,26 +98,27 @@ def _fetch_hl_mark_price(coin: str) -> Optional[float]:
 
 
 def scan_opportunities() -> list:
-    """Return list of (coin, spread_bp_per_hr, direction) where direction is:
-       'long_hl_short_bf' if HL > Blofin funding (long HL, short Blofin)
-       'short_hl_long_bf' otherwise
+    """Parallel funding-spread scan across COINS.
+
+    Returns list of (coin, spread_bp_per_hr, direction).
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     hl_funding = _fetch_hl_funding()
-    opportunities = []
-    for coin in COINS:
+
+    def _check_coin(coin):
         coin = coin.strip().upper()
-        if not coin: continue
+        if not coin: return None
         hl_h = hl_funding.get(coin)
-        if hl_h is None: continue
+        if hl_h is None: return None
         bf_8h = bf.get_funding_rate(f"{coin}-USDT")
-        if bf_8h is None: continue
-        bf_h = bf_8h / 8   # blofin is per 8-hour cycle
+        if bf_8h is None: return None
+        bf_h = bf_8h / 8
         spread_h = hl_h - bf_h
         spread_bp = spread_h * 10000
         if abs(spread_bp) < MIN_SPREAD_BP_PER_HR:
-            continue
+            return None
         direction = "long_hl_short_bf" if spread_bp > 0 else "short_hl_long_bf"
-        opportunities.append({
+        return {
             "coin": coin,
             "hl_funding_pct_hr": hl_h * 100,
             "bf_funding_pct_hr": bf_h * 100,
@@ -125,7 +126,15 @@ def scan_opportunities() -> list:
             "abs_spread_bp_hr": abs(spread_bp),
             "annual_pct": abs(spread_bp) * 24 * 365 / 100,
             "direction": direction,
-        })
+        }
+
+    opportunities = []
+    # 12 workers — Blofin rate limit is 500/min/IP, so 12 parallel × ~1s/call = safe
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for r in as_completed([ex.submit(_check_coin, c) for c in COINS]):
+            result = r.result()
+            if result: opportunities.append(result)
+
     opportunities.sort(key=lambda x: -x["abs_spread_bp_hr"])
     return opportunities
 
@@ -412,36 +421,42 @@ def get_state() -> dict:
 # ─── Cross-venue price divergence detector ──────────────────────────────────
 
 def scan_price_divergence() -> list:
-    """Detect price divergence between HL and Blofin for arbitrage.
+    """Parallel price-divergence scan between HL and Blofin."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    MIN_PCT = float(os.environ.get("PRICE_DIVERGENCE_MIN_PCT", "0.002"))
 
-    When HL_price and Blofin_price differ by > PRICE_DIVERGENCE_MIN_PCT,
-    there's a tradable arb (long the cheap venue, short the expensive one).
+    # Fetch all HL mids in one call (much faster than per-coin)
+    try:
+        import json as _j, urllib.request as _ur
+        req = _ur.Request("https://api.hyperliquid.xyz/info",
+            data=_j.dumps({"type": "allMids"}).encode(),
+            headers={"Content-Type": "application/json"})
+        with _ur.urlopen(req, timeout=10) as r:
+            hl_mids = {k: float(v) for k, v in _j.loads(r.read()).items()}
+    except Exception:
+        hl_mids = {}
 
-    Convergence happens via funding + maker flow, usually within minutes.
-    """
-    MIN_PCT = float(os.environ.get("PRICE_DIVERGENCE_MIN_PCT", "0.002"))   # 0.2%
-    divergences = []
-    for coin in COINS:
+    def _check_coin(coin):
         coin = coin.strip().upper()
-        if not coin: continue
-        hl_px = _fetch_hl_mark_price(coin)
+        if not coin: return None
+        hl_px = hl_mids.get(coin)
+        if hl_px is None: return None
         bf_px = bf.get_mark_price(f"{coin}-USDT")
-        if hl_px is None or bf_px is None: continue
-        if hl_px <= 0 or bf_px <= 0: continue
+        if bf_px is None or hl_px <= 0 or bf_px <= 0: return None
         diff_pct = (hl_px - bf_px) / ((hl_px + bf_px) / 2)
-        if abs(diff_pct) < MIN_PCT: continue
-        if diff_pct > 0:
-            # HL is more expensive — short HL, long Blofin
-            action = "short_hl_long_bf"
-        else:
-            action = "long_hl_short_bf"
-        divergences.append({
-            "coin": coin,
-            "hl_price": hl_px,
-            "bf_price": bf_px,
-            "diff_pct": diff_pct * 100,
-            "diff_bp": diff_pct * 10000,
+        if abs(diff_pct) < MIN_PCT: return None
+        action = "short_hl_long_bf" if diff_pct > 0 else "long_hl_short_bf"
+        return {
+            "coin": coin, "hl_price": hl_px, "bf_price": bf_px,
+            "diff_pct": diff_pct * 100, "diff_bp": diff_pct * 10000,
             "action": action,
-        })
+        }
+
+    divergences = []
+    with ThreadPoolExecutor(max_workers=12) as ex:
+        for r in as_completed([ex.submit(_check_coin, c) for c in COINS]):
+            result = r.result()
+            if result: divergences.append(result)
+
     divergences.sort(key=lambda x: -abs(x["diff_pct"]))
     return divergences
