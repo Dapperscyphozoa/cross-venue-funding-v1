@@ -426,6 +426,20 @@ def main():
 
     persistence.init_db()
     threading.Thread(target=scan_loop, daemon=True, name="scan").start()
+
+    # Self-ping to prevent Render free-tier sleep (every 10min)
+    def _self_ping():
+        import urllib.request as _ur, time as _t
+        _t.sleep(60)
+        url = os.environ.get("RENDER_EXTERNAL_URL", "https://cross-venue-funding-v1.onrender.com")
+        while True:
+            try:
+                req = _ur.Request(f"{url}/health", headers={"User-Agent":"keepalive"})
+                _ur.urlopen(req, timeout=5).read()
+            except Exception:
+                pass
+            _t.sleep(600)
+    threading.Thread(target=_self_ping, daemon=True, name="keepalive").start()
     threading.Thread(target=position_loop, daemon=True, name="positions").start()
     threading.Thread(target=reconcile_loop, daemon=True, name="reconcile").start()
 
