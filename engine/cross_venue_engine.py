@@ -143,6 +143,41 @@ def scan_opportunities() -> list:
 _positions: Dict[str, Dict[str, Any]] = {}   # coin -> {opened_ts, direction, hl_size, bf_size, ...}
 _positions_lock = threading.Lock()
 
+# Persistence: dump positions to disk so they survive restarts.
+# In DRY_RUN mode this preserves accrued spread/time. In live mode it's
+# essential — restart without state = orphaned positions on both venues.
+_state_dir = os.environ.get("STATE_DIR", "/tmp/cvf-state")
+_state_file = os.path.join(_state_dir, "cvf_positions.json")
+
+
+def _persist_positions():
+    try:
+        os.makedirs(_state_dir, exist_ok=True)
+        with _positions_lock:
+            snapshot = dict(_positions)
+        with open(_state_file, "w") as f:
+            json.dump(snapshot, f, default=str)
+    except Exception as e:
+        print(f"[cvf] persist error: {e}", flush=True)
+
+
+def _load_positions():
+    try:
+        with open(_state_file) as f:
+            data = json.load(f)
+        with _positions_lock:
+            _positions.update(data)
+        if data:
+            print(f"[cvf] restored {len(data)} positions from disk: "
+                   f"{list(data.keys())}", flush=True)
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print(f"[cvf] load error: {e}", flush=True)
+
+
+_load_positions()
+
 
 def can_open_more() -> bool:
     with _positions_lock:
@@ -179,6 +214,7 @@ def open_paired_position(opp: dict) -> Optional[dict]:
         }
         with _positions_lock:
             _positions[coin] = pos
+        _persist_positions()
         return pos
 
     # ── LIVE EXECUTION ──
@@ -275,6 +311,7 @@ def close_paired_position(coin: str) -> Optional[dict]:
         pos = _positions.pop(coin, None)
     if not pos:
         return None
+    _persist_positions()
 
     held_hours = (int(time.time() * 1000) - pos["opened_ts"]) / 3600_000
     accrued_bp = pos["entry_spread_bp_hr"] * held_hours
