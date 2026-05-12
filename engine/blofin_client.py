@@ -69,7 +69,7 @@ def _request(method: str, path: str, params: Optional[dict] = None,
         data = body_str.encode()
 
     if auth:
-        if not API_KEY or not API_SECRET or not PASSPHRASE:
+        if not API_KEY or not API_SECRET:
             return {"error": "blofin_creds_missing"}
         timestamp = str(int(time.time() * 1000))
         nonce = uuid.uuid4().hex
@@ -220,7 +220,7 @@ def transfer(currency: str, amount: str, from_account: str,
 def health_check() -> dict:
     """Returns {public_ok, auth_ok, has_creds, balance_usdt}."""
     out = {
-        "has_creds": bool(API_KEY and API_SECRET and PASSPHRASE),
+        "has_creds": bool(API_KEY and API_SECRET),
         "public_ok": False,
         "auth_ok": False,
         "balance_usdt": None,
@@ -230,7 +230,7 @@ def health_check() -> dict:
     fr = get_funding_rate("BTC-USDT")
     out["public_ok"] = fr is not None
     if not out["has_creds"]:
-        out["error"] = "BLOFIN_API_KEY/SECRET/PASSPHRASE not set"
+        out["error"] = "BLOFIN_API_KEY/SECRET not set"
         return out
     # Auth check
     bal = get_balance("futures")
@@ -247,48 +247,3 @@ def health_check() -> dict:
     elif bal:
         out["error"] = bal.get("error") or "auth_unknown"
     return out
-
-
-
-# ─── Contract spec helpers ──────────────────────────────────────────────────
-
-_inst_cache = {"ts": 0, "by_id": {}}
-_INST_TTL = 3600  # 1 hour
-
-
-def get_instrument_spec(inst_id: str) -> Optional[dict]:
-    """Get contract spec including minSize, contractValue, etc.
-    Cached 1h."""
-    import time as _t
-    now = _t.time()
-    if now - _inst_cache["ts"] > _INST_TTL or not _inst_cache["by_id"]:
-        instruments = get_instruments("SWAP")
-        _inst_cache["by_id"] = {i.get("instId"): i for i in instruments if i.get("instId")}
-        _inst_cache["ts"] = now
-    return _inst_cache["by_id"].get(inst_id)
-
-
-def coin_size_to_contracts(coin: str, coin_size: float) -> Optional[str]:
-    """Convert a desired coin-units size to Blofin contract count string.
-
-    Blofin uses 'contractValue' field in instrument spec (e.g. 0.001 BTC per contract).
-    Returns contract count as string for placing orders, or None if conversion fails.
-    """
-    inst_id = f"{coin}-USDT"
-    spec = get_instrument_spec(inst_id)
-    if not spec:
-        return None
-    try:
-        cv = float(spec.get("contractValue", 1))
-        if cv <= 0: return None
-        contracts = coin_size / cv
-        # Round down to lot size (lotSize field)
-        lot = float(spec.get("lotSize", 1))
-        if lot > 0:
-            contracts = int(contracts / lot) * lot
-        if contracts <= 0:
-            return None
-        # Format with appropriate decimals
-        return f"{contracts:.0f}" if contracts >= 1 else f"{contracts}"
-    except Exception:
-        return None
